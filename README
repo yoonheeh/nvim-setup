@@ -1,0 +1,7 @@
+# Notes
+Inspired by https://github.com/ThePrimeagen/init.lua
+
+# File structure
+`init.lua` on the first level just gives entry 
+
+`lua/yoonhee/init.lua` applies custom settings
