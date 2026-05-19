@@ -1,6 +1,7 @@
 return {
   'akinsho/toggleterm.nvim',
   version = "*",
+  cmd = { "ToggleTerm" },
   keys = {
     {
       "<leader>t",
@@ -10,7 +11,7 @@ return {
         if buf_dir == "" or vim.fn.isdirectory(buf_dir) == 0 then
           buf_dir = vim.fn.getcwd()
         end
-        vim.cmd(tabnr .. "ToggleTerm dir=" .. vim.fn.fnameescape(buf_dir))
+        vim.cmd(tabnr .. "ToggleTerm direction=float dir=" .. vim.fn.fnameescape(buf_dir))
       end,
       desc = "Toggle tab-scoped terminal",
     },
