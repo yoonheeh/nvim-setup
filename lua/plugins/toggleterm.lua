@@ -18,4 +18,4 @@ return {
     { "<Esc><Esc>", [[<C-\><C-n>]], mode = "t", desc = "Exit terminal mode" },
   },
   config = true,
-};
+}
