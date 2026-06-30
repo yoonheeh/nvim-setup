@@ -1,22 +1,10 @@
+-- Assorted lazy-loaded utility plugins.
 return {
-  -- the colorscheme should be available when starting Neovim
-  {
-    "bluz71/vim-moonfly-colors",
-    name = "moonfly",
-    config = function()
-      vim.cmd [[colorscheme moonfly]]
-    end,
-  },
-
-  -- I have a separate config.mappings file where I require which-key.
-  -- With lazy the plugin will be automatically loaded when it is required somewhere
-  { "folke/which-key.nvim", lazy = true },
-
   {
     "nvim-neorg/neorg",
     -- lazy-load on filetype
     ft = "norg",
-    -- options for neorg. This will automatically call `require("neorg").setup(opts)`
+    -- automatically calls require("neorg").setup(opts)
     opts = {
       load = {
         ["core.defaults"] = {},
@@ -28,33 +16,15 @@ return {
     "dstein64/vim-startuptime",
     -- lazy-load on a command
     cmd = "StartupTime",
-    -- init is called during startup. Configuration for vim plugins typically should be set in an init function
     init = function()
       vim.g.startuptime_tries = 10
     end,
   },
 
-  {
-    "hrsh7th/nvim-cmp",
-    -- load cmp on InsertEnter
-    event = "InsertEnter",
-    -- these dependencies will only be loaded when cmp loads
-    -- dependencies are always lazy-loaded unless specified otherwise
-    dependencies = {
-      "hrsh7th/cmp-nvim-lsp",
-      "hrsh7th/cmp-buffer",
-    },
-    config = function()
-      -- ...
-    end,
-  },
-
-  -- if some code requires a module from an unloaded plugin, it will be automatically loaded.
-  -- So for api plugins like devicons, we can always set lazy=true
+  -- API plugin used by other plugins; load on demand.
   { "nvim-tree/nvim-web-devicons", lazy = true },
 
-  -- you can use the VeryLazy event for things that can
-  -- load later and are not important for the initial UI
+  -- UI niceties that can load after the initial screen.
   { "stevearc/dressing.nvim", event = "VeryLazy" },
 
   {
@@ -68,7 +38,6 @@ return {
   {
     "monaqa/dial.nvim",
     -- lazy-load on keys
-    -- mode is `n` by default. For more advanced options, check the section on key mappings
     keys = { "<C-a>", { "<C-x>", mode = "n" } },
   },
 }

@@ -1,4 +1,4 @@
-vim.g.mapleader = " "
+-- mapleader is set in lazy_init.lua before lazy.nvim loads.
 
 -- allow copy to clipboard
 -- next greatest remap ever : asbjornHaland
