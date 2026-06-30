@@ -2,12 +2,16 @@ return {
   {
     "lewis6991/gitsigns.nvim",
     config = function()
-      require("gitsigns").setup({
+      local gs = require("gitsigns")
+      gs.setup({
         current_line_blame = true,
         current_line_blame_opts = {
           delay = 300,
         },
       })
+
+      vim.keymap.set("n", "<leader>gh", gs.toggle_linehl,    { desc = "Git: toggle line highlights" })
+      vim.keymap.set("n", "<leader>gd", gs.toggle_word_diff, { desc = "Git: toggle word diff" })
     end,
   },
   {

@@ -1,13 +1,10 @@
 return {
   -- the colorscheme should be available when starting Neovim
   {
-    "tiagovla/tokyodark.nvim",
-    opts = {
-        -- custom options here
-    },
-    config = function(_, opts)
-        require("tokyodark").setup(opts) -- calling setup is optional
-        vim.cmd [[colorscheme tokyodark]]
+    "bluz71/vim-moonfly-colors",
+    name = "moonfly",
+    config = function()
+      vim.cmd [[colorscheme moonfly]]
     end,
   },
 

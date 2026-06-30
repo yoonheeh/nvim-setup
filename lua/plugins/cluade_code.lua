@@ -6,8 +6,16 @@ return {
   config = function()
     require("claude-code").setup({
       window = {
-        position = "topleft",
-        split_ratio = 0.75,
+        position = "float",
+        float = {
+          width    = "100%",
+          height   = "100%",
+          border   = "none",
+          relative = "editor",
+        },
+      },
+      git = {
+        use_git_root = false,
       },
     })
   end
