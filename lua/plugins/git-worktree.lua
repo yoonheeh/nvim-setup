@@ -190,6 +190,36 @@ local function list_worktrees()
   return result
 end
 
+-- Bazel keeps each workspace's build output in its own folder under
+-- ~/.cache/bazel/_bazel_$USER/, and removing the worktree leaves it behind.
+-- Each of those folders has a DO_NOT_BUILD_HERE file holding the workspace
+-- path, so this finds the Bazel workspaces built inside `path`.
+local function bazel_workspaces_in(path)
+  local user = vim.uv.os_get_passwd().username
+  local found = {}
+  for _, marker in ipairs(vim.fn.glob(vim.fn.expand("~/.cache/bazel/_bazel_" .. user) .. "/*/DO_NOT_BUILD_HERE", false, true)) do
+    local ok, lines = pcall(vim.fn.readfile, marker, "", 1)
+    local ws = ok and lines[1] and strip_slash(lines[1])
+    if ws and (ws == path or vim.startswith(ws, path .. "/")) and vim.fn.isdirectory(ws) == 1 then
+      table.insert(found, ws)
+    end
+  end
+  return found
+end
+
+-- Must run before the worktree is removed: bazel needs the workspace folder
+-- to find its output folder.
+local function bazel_expunge(path)
+  for _, ws in ipairs(bazel_workspaces_in(path)) do
+    print(" bazel clean --expunge in " .. ws .. " ...")
+    vim.cmd("redraw")
+    local res = vim.system({ "bazel", "clean", "--expunge" }, { cwd = ws }):wait()
+    if res.code ~= 0 then
+      vim.notify("bazel clean --expunge failed in " .. ws .. ":\n" .. (res.stderr or ""), vim.log.levels.WARN)
+    end
+  end
+end
+
 local function switch_to_worktree_tab(path)
   local abs_path = strip_slash(vim.fn.fnamemodify(path, ":p"))
 
@@ -366,6 +396,7 @@ return {
               -- Name it now: it is built from the real path, which is gone after removal.
               local claude_tmux = require("yoonhee.claude_tmux")
               local claude_session = claude_tmux.session_name(wt.path)
+              bazel_expunge(wt.path)
               vim.fn.system({ "git", "worktree", "remove", wt.path })
               if vim.v.shell_error ~= 0 then
                 local force = vim.fn.input("Remove failed. Force delete? [y/n]: ")
