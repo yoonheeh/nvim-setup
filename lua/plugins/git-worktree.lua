@@ -363,6 +363,9 @@ return {
                 return
               end
               actions.close(prompt_bufnr)
+              -- Name it now: it is built from the real path, which is gone after removal.
+              local claude_tmux = require("yoonhee.claude_tmux")
+              local claude_session = claude_tmux.session_name(wt.path)
               vim.fn.system({ "git", "worktree", "remove", wt.path })
               if vim.v.shell_error ~= 0 then
                 local force = vim.fn.input("Remove failed. Force delete? [y/n]: ")
@@ -373,6 +376,7 @@ return {
                   return
                 end
               end
+              claude_tmux.kill(claude_session) -- stop a Claude left running in the deleted folder
               if not wt.branch then return end -- detached HEAD: no branch to delete
               local delete_branch = vim.fn.input("Also delete branch " .. wt.branch .. "? [y/n]: ")
               if delete_branch:lower():sub(1, 1) == "y" then
