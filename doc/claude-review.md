@@ -10,6 +10,10 @@ that made the changes, so Claude can reference its own reasoning and prior task 
 
 Threads live for the duration of the Neovim session (not persisted to disk).
 
+Each worktree tab (tab-local cwd set with `:tcd`) has its own Claude session, threads,
+and panel. A reply that arrives while you're in another worktree's tab updates that
+worktree's panel without opening anything in the tab you're looking at.
+
 ## Workflow
 
 ```
