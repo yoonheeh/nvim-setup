@@ -1,23 +1,38 @@
 -- GitHub-style code review interface backed by Claude terminal session.
 -- Threads are session-only (not persisted). Transport: claude --resume <id> -p "..."
+--
+-- Each worktree tab (tab-local cwd via :tcd) gets its own Claude session,
+-- threads, and panel, keyed by that cwd.
 
 local M = {}
 
 local state = {
-  session_id = nil,
-  threads    = {},
-  extmarks   = {},   -- { [bufnr] = { {id, thread_idx}, ... } }
-  ns_id      = vim.api.nvim_create_namespace("claude_review"),
-  panel_buf  = nil,
-  panel_win  = nil,
-  active_idx = nil,
+  worktrees = {},   -- { [cwd] = { cwd, session_id, threads, active, panel_buf, panel_win } }
+  extmarks  = {},   -- { [bufnr] = { {id, thread}, ... } }
+  ns_id     = vim.api.nvim_create_namespace("claude_review"),
 }
+
+-- State for the worktree of the current tab.
+local function current_wt()
+  local cwd = vim.fn.getcwd()
+  local wt  = state.worktrees[cwd]
+  if not wt then
+    wt = { cwd = cwd, session_id = nil, threads = {}, active = nil, panel_buf = nil, panel_win = nil }
+    state.worktrees[cwd] = wt
+  end
+  return wt
+end
+
+local function index_of(wt, thread)
+  for i, t in ipairs(wt.threads) do
+    if t == thread then return i end
+  end
+end
 
 -- ── Session discovery ────────────────────────────────────────────────────
 -- Mirrors git-worktree.lua's JSONL-scanning approach.
 
-local function find_session_id()
-  local cwd     = vim.fn.getcwd()
+local function find_session_id(cwd)
   local encoded = cwd:gsub("[/.]", "-")
   local proj    = vim.fn.expand("~/.claude/projects/" .. encoded)
 
@@ -34,15 +49,20 @@ end
 
 -- ── Panel ────────────────────────────────────────────────────────────────
 
-local function ensure_panel()
-  if state.panel_buf and vim.api.nvim_buf_is_valid(state.panel_buf)
-    and state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-    return
+local function ensure_panel(wt)
+  if wt.panel_buf and vim.api.nvim_buf_is_valid(wt.panel_buf)
+    and wt.panel_win and vim.api.nvim_win_is_valid(wt.panel_win) then
+    -- Floats belong to the tab they were opened in; a panel left in another
+    -- tab with the same cwd stays valid but is invisible here.
+    if vim.api.nvim_win_get_tabpage(wt.panel_win) == vim.api.nvim_get_current_tabpage() then
+      return
+    end
+    vim.api.nvim_win_close(wt.panel_win, true)
   end
 
-  state.panel_buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_set_option_value("buftype",   "nofile", { buf = state.panel_buf })
-  vim.api.nvim_set_option_value("bufhidden", "wipe",   { buf = state.panel_buf })
+  wt.panel_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_option_value("buftype",   "nofile", { buf = wt.panel_buf })
+  vim.api.nvim_set_option_value("bufhidden", "wipe",   { buf = wt.panel_buf })
 
   local total_w = vim.o.columns
   local total_h = vim.o.lines
@@ -52,7 +72,7 @@ local function ensure_panel()
   -- height: vim.o.lines includes statusline + cmdline; subtract them plus border
   local height  = total_h - vim.o.cmdheight - 3
 
-  state.panel_win = vim.api.nvim_open_win(state.panel_buf, false, {
+  wt.panel_win = vim.api.nvim_open_win(wt.panel_buf, false, {
     relative = "editor",
     row      = 1,
     col      = col,
@@ -62,29 +82,37 @@ local function ensure_panel()
     zindex   = 50,
   })
   -- Force Normal colors; NormalFloat may have invisible fg on some themes
-  vim.api.nvim_set_option_value("winhighlight", "Normal:Normal,FloatBorder:FloatBorder", { win = state.panel_win })
+  vim.api.nvim_set_option_value("winhighlight", "Normal:Normal,FloatBorder:FloatBorder", { win = wt.panel_win })
 
-  vim.api.nvim_set_option_value("wrap",           true,  { win = state.panel_win })
-  vim.api.nvim_set_option_value("linebreak",      true,  { win = state.panel_win })
-  vim.api.nvim_set_option_value("number",         false, { win = state.panel_win })
-  vim.api.nvim_set_option_value("relativenumber", false, { win = state.panel_win })
-  vim.api.nvim_set_option_value("signcolumn",     "no",  { win = state.panel_win })
+  vim.api.nvim_set_option_value("wrap",           true,  { win = wt.panel_win })
+  vim.api.nvim_set_option_value("linebreak",      true,  { win = wt.panel_win })
+  vim.api.nvim_set_option_value("number",         false, { win = wt.panel_win })
+  vim.api.nvim_set_option_value("relativenumber", false, { win = wt.panel_win })
+  vim.api.nvim_set_option_value("signcolumn",     "no",  { win = wt.panel_win })
 
-  local buf = state.panel_buf
-  vim.keymap.set("n", "q", function() M.close_panel() end,  { buffer = buf, desc = "Close review panel" })
-  vim.keymap.set("n", "r", function() M.reply() end,        { buffer = buf, desc = "Reply to thread" })
-  vim.keymap.set("n", "n", function() M.navigate(1) end,    { buffer = buf, desc = "Next thread" })
-  vim.keymap.set("n", "p", function() M.navigate(-1) end,   { buffer = buf, desc = "Prev thread" })
+  -- Bind the panel's keys to the worktree that opened it, so they keep working
+  -- on that worktree even if this tab's cwd changes later.
+  local buf = wt.panel_buf
+  vim.keymap.set("n", "q", function() M.close_panel(wt) end,  { buffer = buf, desc = "Close review panel" })
+  vim.keymap.set("n", "r", function() M.reply(wt) end,        { buffer = buf, desc = "Reply to thread" })
+  vim.keymap.set("n", "n", function() M.navigate(1, wt) end,  { buffer = buf, desc = "Next thread" })
+  vim.keymap.set("n", "p", function() M.navigate(-1, wt) end, { buffer = buf, desc = "Prev thread" })
 end
 
 local panel_ns = vim.api.nvim_create_namespace("claude_review_panel")
 
-local function render_panel(thread_idx)
-  state.active_idx = thread_idx
-  ensure_panel()
-
-  local thread = state.threads[thread_idx]
+-- Show `thread` in wt's panel. The panel is (re)opened only when wt is the
+-- current tab's worktree; a reply that arrives while another worktree's tab
+-- is focused just updates wt's panel buffer, if it still exists.
+local function render_panel(wt, thread)
   if not thread then return end
+  wt.active = thread
+
+  if wt == current_wt() then
+    ensure_panel(wt)
+  elseif not (wt.panel_buf and vim.api.nvim_buf_is_valid(wt.panel_buf)) then
+    return
+  end
 
   local lines  = {}
   local hls    = {}  -- { line_idx (0-based), col_s, col_e, group }
@@ -93,8 +121,7 @@ local function render_panel(thread_idx)
     table.insert(hls, { #lines - 1, 0, col_e, group })
   end
 
-  local rel    = vim.fn.fnamemodify(thread.file, ":.")
-  local header = string.format("  %s : %d\226\128\147%d", rel, thread.start_line, thread.end_line)
+  local header = string.format("  %s : %d\226\128\147%d", thread.rel, thread.start_line, thread.end_line)
   table.insert(lines, header)
   hl("Title", #header)
   table.insert(lines, string.rep("\226\148\128", 60))
@@ -124,42 +151,39 @@ local function render_panel(thread_idx)
   table.insert(lines, footer)
   hl("Comment", -1)
 
-  if #state.threads > 1 then
-    table.insert(lines, string.format("    Thread %d / %d", thread_idx, #state.threads))
+  if #wt.threads > 1 then
+    table.insert(lines, string.format("    Thread %d / %d", index_of(wt, thread) or 0, #wt.threads))
     hl("LineNr", -1)
   end
 
-  vim.api.nvim_buf_set_lines(state.panel_buf, 0, -1, false, lines)
-  vim.api.nvim_buf_clear_namespace(state.panel_buf, panel_ns, 0, -1)
+  vim.api.nvim_buf_set_lines(wt.panel_buf, 0, -1, false, lines)
+  vim.api.nvim_buf_clear_namespace(wt.panel_buf, panel_ns, 0, -1)
   for _, h in ipairs(hls) do
-    vim.api.nvim_buf_add_highlight(state.panel_buf, panel_ns, h[4], h[1], h[2], h[3])
+    vim.api.nvim_buf_add_highlight(wt.panel_buf, panel_ns, h[4], h[1], h[2], h[3])
   end
 
-  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-    local shown = vim.api.nvim_win_get_buf(state.panel_win)
-    if shown ~= state.panel_buf then
+  if wt.panel_win and vim.api.nvim_win_is_valid(wt.panel_win) then
+    local shown = vim.api.nvim_win_get_buf(wt.panel_win)
+    if shown ~= wt.panel_buf then
       vim.notify(
         string.format("[claude-review] BUG: panel_win %d shows buf %d, expected buf %d",
-          state.panel_win, shown, state.panel_buf),
+          wt.panel_win, shown, wt.panel_buf),
         vim.log.levels.ERROR
       )
       -- Fix: force the correct buffer into the window
-      vim.api.nvim_win_set_buf(state.panel_win, state.panel_buf)
+      vim.api.nvim_win_set_buf(wt.panel_win, wt.panel_buf)
     end
-    vim.api.nvim_win_set_cursor(state.panel_win, { #lines, 0 })
+    vim.api.nvim_win_set_cursor(wt.panel_win, { #lines, 0 })
   end
 end
 
 -- ── Extmarks ─────────────────────────────────────────────────────────────
 
-local function update_extmark(bufnr, thread_idx)
-  local thread = state.threads[thread_idx]
-  if not thread then return end
-
+local function update_extmark(bufnr, thread)
   state.extmarks[bufnr] = state.extmarks[bufnr] or {}
 
   for i, em in ipairs(state.extmarks[bufnr]) do
-    if em.thread_idx == thread_idx then
+    if em.thread == thread then
       vim.api.nvim_buf_del_extmark(bufnr, state.ns_id, em.id)
       table.remove(state.extmarks[bufnr], i)
       break
@@ -174,13 +198,13 @@ local function update_extmark(bufnr, thread_idx)
     virt_text     = { { label, "Comment" } },
     virt_text_pos = "eol",
   })
-  table.insert(state.extmarks[bufnr], { id = id, thread_idx = thread_idx })
+  table.insert(state.extmarks[bufnr], { id = id, thread = thread })
 end
 
 -- ── Transport ────────────────────────────────────────────────────────────
 
-local function run_claude(prompt, on_response)
-  local sid = state.session_id
+local function run_claude(wt, prompt, on_response)
+  local sid = wt.session_id
   if not sid then
     vim.notify("[claude-review] No Claude session found for this project", vim.log.levels.ERROR)
     on_response(nil)
@@ -188,7 +212,9 @@ local function run_claude(prompt, on_response)
   end
 
   local chunks = {}
+  -- Claude sessions are stored per project directory, so --resume must run in wt's cwd.
   vim.fn.jobstart({ "claude", "--resume", sid, "-p", prompt }, {
+    cwd = wt.cwd,
     stdout_buffered = false,
     on_stdout = function(_, data)
       for _, chunk in ipairs(data) do
@@ -210,25 +236,23 @@ end
 
 -- ── Prompt builders ───────────────────────────────────────────────────────
 
-local function get_diff(filepath)
-  local rel    = vim.fn.fnamemodify(filepath, ":.")
-  local result = vim.fn.system({ "git", "diff", "HEAD", "--", rel })
+local function get_diff(cwd, filepath)
+  local result = vim.fn.system({ "git", "-C", cwd, "diff", "HEAD", "--", filepath })
   if vim.v.shell_error ~= 0 or result == "" then
-    result = vim.fn.system({ "git", "diff", "--", rel })
+    result = vim.fn.system({ "git", "-C", cwd, "diff", "--", filepath })
   end
   return result
 end
 
-local function build_first_prompt(thread, question)
-  local ft   = vim.api.nvim_get_option_value("filetype", { buf = 0 })
-  local rel  = vim.fn.fnamemodify(thread.file, ":.")
+local function build_first_prompt(wt, thread, question)
+  local ft   = thread.filetype
   local code = table.concat(thread.code_lines, "\n")
-  local diff = get_diff(thread.file)
+  local diff = get_diff(wt.cwd, thread.file)
 
   local parts = {
     "[claude-review] Automated inline review request from Neovim. Answer the question directly; no meta-commentary needed.",
     "",
-    string.format("File: %s, lines %d\226\128\147%d:", rel, thread.start_line, thread.end_line),
+    string.format("File: %s, lines %d\226\128\147%d:", thread.rel, thread.start_line, thread.end_line),
     "```" .. (ft ~= "" and ft or ""),
     code,
     "```",
@@ -243,10 +267,9 @@ local function build_first_prompt(thread, question)
 end
 
 local function build_reply_prompt(thread, reply_text)
-  local rel = vim.fn.fnamemodify(thread.file, ":.")
   return string.format(
     "[claude-review] Follow-up on %s lines %d\226\128\147%d.\n\n%s",
-    rel, thread.start_line, thread.end_line, reply_text
+    thread.rel, thread.start_line, thread.end_line, reply_text
   )
 end
 
@@ -306,6 +329,7 @@ end
 -- ── Public actions ────────────────────────────────────────────────────────
 
 function M.start_thread()
+  local wt         = current_wt()
   local start_line = vim.fn.line("'<")
   local end_line   = vim.fn.line("'>")
   local bufnr      = vim.api.nvim_get_current_buf()
@@ -316,12 +340,12 @@ function M.start_thread()
     if not question or question == "" then return end
 
     -- Resolve session lazily at submit time so the panel always opens
-    if not state.session_id then
-      state.session_id = find_session_id()
+    if not wt.session_id then
+      wt.session_id = find_session_id(wt.cwd)
     end
-    if not state.session_id then
+    if not wt.session_id then
       vim.notify(
-        "[claude-review] No Claude session found for: " .. vim.fn.getcwd()
+        "[claude-review] No Claude session found for: " .. wt.cwd
           .. "\n  Check :ClaudeReviewDebug for details.",
         vim.log.levels.ERROR
       )
@@ -330,98 +354,100 @@ function M.start_thread()
 
     local thread = {
       file       = filepath,
+      rel        = vim.fn.fnamemodify(filepath, ":."),
+      filetype   = vim.api.nvim_get_option_value("filetype", { buf = bufnr }),
       start_line = start_line,
       end_line   = end_line,
       code_lines = code_lines,
       messages   = { { role = "user", content = question } },
       loading    = true,
     }
-    table.insert(state.threads, thread)
-    local idx = #state.threads
+    table.insert(wt.threads, thread)
 
-    update_extmark(bufnr, idx)
-    render_panel(idx)
+    update_extmark(bufnr, thread)
+    render_panel(wt, thread)
 
-    run_claude(build_first_prompt(thread, question), function(response)
+    run_claude(wt, build_first_prompt(wt, thread, question), function(response)
       thread.loading = false
       if response then
         table.insert(thread.messages, { role = "assistant", content = response })
-        update_extmark(bufnr, idx)
       else
         table.insert(thread.messages, { role = "assistant", content = "[Error: no response received]" })
       end
-      render_panel(idx)
+      if vim.api.nvim_buf_is_valid(bufnr) then update_extmark(bufnr, thread) end
+      render_panel(wt, thread)
     end)
   end)
 end
 
-function M.reply()
-  local idx = state.active_idx
-  if not idx then
+function M.reply(wt)
+  wt           = wt or current_wt()
+  local thread = wt.active
+  if not thread then
     vim.notify("[claude-review] No active thread", vim.log.levels.WARN)
     return
   end
-  local thread = state.threads[idx]
-  if not thread then return end
 
   open_input_panel("Reply:", function(reply_text)
     if not reply_text or reply_text == "" then return end
 
     table.insert(thread.messages, { role = "user", content = reply_text })
     thread.loading = true
-    render_panel(idx)
+    render_panel(wt, thread)
 
-    run_claude(build_reply_prompt(thread, reply_text), function(response)
+    run_claude(wt, build_reply_prompt(thread, reply_text), function(response)
       thread.loading = false
       table.insert(thread.messages, {
         role    = "assistant",
         content = response or "[Error: no response received]",
       })
       local bufnr = vim.fn.bufnr(thread.file)
-      if bufnr ~= -1 then update_extmark(bufnr, idx) end
-      render_panel(idx)
+      if bufnr ~= -1 then update_extmark(bufnr, thread) end
+      render_panel(wt, thread)
     end)
   end)
 end
 
+local function focus_panel(wt, thread)
+  render_panel(wt, thread)
+  if wt.panel_win and vim.api.nvim_win_is_valid(wt.panel_win) then
+    vim.api.nvim_set_current_win(wt.panel_win)
+  end
+end
+
 function M.open_at_cursor()
+  local wt          = current_wt()
   local cursor_line = vim.fn.line(".")
   local bufnr       = vim.api.nvim_get_current_buf()
 
   for _, em in ipairs(state.extmarks[bufnr] or {}) do
-    local t = state.threads[em.thread_idx]
-    if t and cursor_line >= t.start_line and cursor_line <= t.end_line then
-      ensure_panel()
-      render_panel(em.thread_idx)
-      if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-        vim.api.nvim_set_current_win(state.panel_win)
-      end
+    local t = em.thread
+    if index_of(wt, t) and cursor_line >= t.start_line and cursor_line <= t.end_line then
+      focus_panel(wt, t)
       return
     end
   end
 
-  if #state.threads > 0 then
-    ensure_panel()
-    render_panel(#state.threads)
-    if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-      vim.api.nvim_set_current_win(state.panel_win)
-    end
+  if #wt.threads > 0 then
+    focus_panel(wt, wt.threads[#wt.threads])
   else
     vim.notify("[claude-review] No review threads yet. Select lines and press <leader>rc.", vim.log.levels.INFO)
   end
 end
 
-function M.navigate(dir)
-  if #state.threads == 0 then return end
-  local current  = state.active_idx or 1
-  local next_idx = ((current - 1 + dir) % #state.threads) + 1
-  render_panel(next_idx)
+function M.navigate(dir, wt)
+  wt = wt or current_wt()
+  if #wt.threads == 0 then return end
+  local current  = (wt.active and index_of(wt, wt.active)) or 1
+  local next_idx = ((current - 1 + dir) % #wt.threads) + 1
+  local thread   = wt.threads[next_idx]
+  render_panel(wt, thread)
 
-  local thread = state.threads[next_idx]
-  local bufnr  = vim.fn.bufnr(thread.file)
+  local bufnr = vim.fn.bufnr(thread.file)
   if bufnr ~= -1 then
-    for _, winid in ipairs(vim.api.nvim_list_wins()) do
-      if vim.api.nvim_win_get_buf(winid) == bufnr and winid ~= state.panel_win then
+    -- Only windows in this tab; the same file may be open in another worktree's tab.
+    for _, winid in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if vim.api.nvim_win_get_buf(winid) == bufnr and winid ~= wt.panel_win then
         vim.api.nvim_win_set_cursor(winid, { thread.start_line, 0 })
         break
       end
@@ -429,31 +455,40 @@ function M.navigate(dir)
   end
 end
 
-function M.close_panel()
-  if state.panel_win and vim.api.nvim_win_is_valid(state.panel_win) then
-    vim.api.nvim_win_close(state.panel_win, true)
+function M.close_panel(wt)
+  wt = wt or current_wt()
+  if wt.panel_win and vim.api.nvim_win_is_valid(wt.panel_win) then
+    vim.api.nvim_win_close(wt.panel_win, true)
   end
-  state.panel_win = nil
-  state.panel_buf = nil
+  wt.panel_win = nil
+  wt.panel_buf = nil
 end
 
 function M.clear_threads()
+  local wt       = current_wt()
   local bufnr    = vim.api.nvim_get_current_buf()
   local filepath = vim.api.nvim_buf_get_name(bufnr)
 
+  -- Only this worktree's markers; the same buffer may also carry threads
+  -- started from another worktree's tab.
+  local kept = {}
   for _, em in ipairs(state.extmarks[bufnr] or {}) do
-    vim.api.nvim_buf_del_extmark(bufnr, state.ns_id, em.id)
+    if index_of(wt, em.thread) then
+      vim.api.nvim_buf_del_extmark(bufnr, state.ns_id, em.id)
+    else
+      table.insert(kept, em)
+    end
   end
-  state.extmarks[bufnr] = {}
+  state.extmarks[bufnr] = kept
 
   local remaining = {}
-  for _, t in ipairs(state.threads) do
+  for _, t in ipairs(wt.threads) do
     if t.file ~= filepath then table.insert(remaining, t) end
   end
-  state.threads  = remaining
-  state.active_idx = nil
+  wt.threads = remaining
+  wt.active  = nil
 
-  M.close_panel()
+  M.close_panel(wt)
   vim.notify("[claude-review] Threads cleared", vim.log.levels.INFO)
 end
 
@@ -467,25 +502,25 @@ function M.setup(_)
 
   -- Debug command
   vim.api.nvim_create_user_command("ClaudeReviewDebug", function()
-    local cwd     = vim.fn.getcwd()
-    local encoded = cwd:gsub("[/.]", "-")
+    local wt      = current_wt()
+    local encoded = wt.cwd:gsub("[/.]", "-")
     local proj    = vim.fn.expand("~/.claude/projects/" .. encoded)
     local files   = vim.fn.glob(proj .. "/*.jsonl", false, true)
-    local sid     = find_session_id()
+    local sid     = find_session_id(wt.cwd)
 
-    local pbuf  = state.panel_buf
-    local pwin  = state.panel_win
+    local pbuf  = wt.panel_buf
+    local pwin  = wt.panel_win
     local pbuf_valid = pbuf and vim.api.nvim_buf_is_valid(pbuf)
     local pwin_valid = pwin and vim.api.nvim_win_is_valid(pwin)
     local shown = pwin_valid and vim.api.nvim_win_get_buf(pwin) or -1
     local match = pbuf_valid and pwin_valid and (shown == pbuf)
 
     local lines = {
-      "cwd:        " .. cwd,
+      "cwd:        " .. wt.cwd,
       "proj dir:   " .. proj,
       "jsonl:      " .. #files .. " file(s)",
-      "session:    " .. (sid or "NOT FOUND"),
-      "threads:    " .. #state.threads,
+      "session:    " .. (sid or "NOT FOUND") .. "  (in use: " .. (wt.session_id or "none yet") .. ")",
+      "threads:    " .. #wt.threads,
       "panel_buf:  " .. tostring(pbuf) .. (pbuf_valid and " (valid)" or " (INVALID)"),
       "panel_win:  " .. tostring(pwin) .. (pwin_valid and " (valid)" or " (INVALID)"),
       "win shows:  buf " .. shown .. (match and "  ✓ match" or "  ✗ MISMATCH — text goes to wrong buffer"),
