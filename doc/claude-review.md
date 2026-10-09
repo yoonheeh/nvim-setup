@@ -23,11 +23,15 @@ worktree's panel without opening anything in the tab you're looking at.
 
 3. Enter visual mode (V), select lines you want to ask about.
 
-4. Press <leader>rc — a prompt appears: "Review comment:"
+4. Press <leader>rc — a comment box opens directly under the selected lines,
+   which stay highlighted. The code below moves down to make room.
 
-5. Type your question. Claude responds in a right-side panel.
+5. Type your question and press Enter. Claude responds in a right-side panel,
+   rendered as markdown (via render-markdown.nvim).
 
-6. Press r in the panel to reply. Multi-turn conversation supported.
+6. Press r in the panel to reply. The reply box docks at the bottom of the panel,
+   chat-style, and the thread's lines are highlighted in the code while you type.
+   Multi-turn conversation supported.
 
 7. A 💬 annotation appears on the selected lines for each thread.
 ```
@@ -56,8 +60,18 @@ message, giving true continuity with terminal A's conversation history.
 | Panel normal | `r`           | Reply to the current thread               |
 | Panel normal | `n` / `p`     | Navigate between threads                  |
 | Panel normal | `q`           | Close the panel                           |
+| Comment box  | `Enter`       | Send (insert or normal mode; `Ctrl-s` too)|
+| Comment box  | `Alt-Enter` / `Shift-Enter` | New line (Shift-Enter only if the terminal reports it) |
+| Comment box  | `Esc` `Esc` / `q` | Cancel                                |
 
 ## Panel layout
+
+The panel is a real split on the far right (42% wide, fixed width), so your own
+`:vsplit`s share the remaining width instead of being covered. Replies open as a
+split under it, in the same column. When the file is open inside a floating
+window (the full-screen `:ClaudeCode` window), a split would sit underneath that
+window, so the panel floats on top instead, and hides while Telescope or the
+Claude terminal has focus.
 
 ```
 ┌── Editor ──────────────────────────────────┬── Thread Panel (40%) ──────────────────┐
