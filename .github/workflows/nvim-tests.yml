@@ -5,7 +5,6 @@ name: nvim-tests
 # setup, no network at test time).
 
 on:
-  push:
   pull_request:
 
 jobs:
