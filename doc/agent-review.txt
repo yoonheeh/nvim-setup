@@ -1,0 +1,152 @@
+*agent-review.txt*  GitHub-style inline code review backed by an agent session
+
+==============================================================================
+CONTENTS                                                  *agent-review-toc*
+
+  1. Overview ......................... |agent-review-overview|
+  2. Workflow ......................... |agent-review-workflow|
+  3. Backends ......................... |agent-review-backends|
+  4. Keymaps and commands ............. |agent-review-keys|
+  5. Panel layout ..................... |agent-review-panel|
+  6. Review prompts ................... |agent-review-prompts|
+  7. Requirements ..................... |agent-review-requirements|
+  8. Tests ............................ |agent-review-tests|
+
+==============================================================================
+1. OVERVIEW                                            *agent-review-overview*
+
+agent-review is a GitHub-style inline code review interface for Neovim,
+backed by the agent terminal session that made the changes. When the agent
+(running in |:OpenCode| or |:ClaudeCode|) edits your files, open a changed
+file, select lines, and ask about them. Questions go to the *same agent
+session* that made the changes, so it can reference its own reasoning and
+prior task context.
+
+Threads live for the duration of the Neovim session (not persisted to disk).
+
+Each worktree tab (tab-local cwd set with |:tcd|) has its own agent
+session, threads, and panel. A reply that arrives while you're in another
+worktree's tab updates that worktree's panel without opening anything in
+the tab you're looking at.
+
+==============================================================================
+2. WORKFLOW                                            *agent-review-workflow*
+
+  1. The agent (terminal A) makes changes to files.
+
+  2. In Neovim, open a changed file.
+
+  3. Enter visual mode (V), select lines you want to ask about.
+
+  4. Press <leader>rc — a comment box opens directly under the selected
+     lines, which stay highlighted. The code below moves down to make room.
+
+  5. Type your question and press Enter. The agent responds in a right-side
+     panel, rendered as markdown (via render-markdown.nvim).
+
+  6. Press r in the panel to reply. The reply box docks at the bottom of
+     the panel, chat-style, and the thread's lines are highlighted in the
+     code while you type. Multi-turn conversation supported.
+
+  7. A 💬 annotation appears on the selected lines for each thread.
+
+==============================================================================
+3. BACKENDS                                          *agent-review-backends*
+
+The answering backend is |g:review_backend| ("claude" by default):
+
+  :ReviewBackend [claude|opencode]              *agent-review-ReviewBackend*
+
+    With no argument, prints the current backend. Otherwise switches to
+    it for subsequently created threads. (A reply always goes to the
+    current backend; each backend's session id is cached separately per
+    worktree tab.)
+
+Session discovery finds the most recently active session for the current
+project:
+
+- claude ... scans `~/.claude/projects/<encoded-cwd>/*.jsonl` and passes
+  the session id to `claude --resume <id> -p "..."` per message.
+- opencode . picks the newest entry for the worktree directory from
+  `opencode session list --format json`, then asks it with
+  `opencode run --session <id> "..." --format json` (continues the
+  session in place, like `--resume`; only `text` reply parts are shown).
+
+==============================================================================
+4. KEYMAPS AND COMMANDS                                  *agent-review-keys*
+
+Visual  <leader>rc ........... Start a review thread on selected lines
+Normal  <leader>rt ........... Open thread panel for line under cursor
+Normal  <leader>rn ........... Jump to next thread
+Normal  <leader>rp ........... Jump to previous thread
+Normal  <leader>rx ........... Clear all threads for the current buffer
+Panel   r .................... Reply to the current thread
+Panel   n / p ................ Navigate between threads
+Panel   q .................... Close the panel
+Input   Enter / Ctrl-s ....... Send (Alt-Enter adds a line)
+Input   Esc Esc / q .......... Cancel
+
+  :AgentReviewDebug                                     *agent-review-debug*
+
+    Show cwd, session lookup, cached session, threads, and panel state
+    for the current worktree. `:ClaudeReviewDebug` is kept as an alias.
+
+==============================================================================
+5. PANEL LAYOUT                                         *agent-review-panel*
+
+The panel is a real split on the far right (42% wide, fixed width), so
+your own splits share the remaining width instead of being covered. When
+the file is open inside a floating window (a full-screen agent float), a
+split would sit underneath that float, so the panel floats on top instead,
+and hides while Telescope or the agent terminal has focus.
+
+==============================================================================
+6. REVIEW PROMPTS                                     *agent-review-prompts*
+
+For the *first message* in a thread: >
+
+  I'm reviewing the changes you just made.
+
+  File: src/algo.ts, lines 42–46:
+  ```typescript
+  <selected lines>
+  ```
+
+  Git diff for this file:
+  ```diff
+  <git diff HEAD -- src/algo.ts>
+  ```
+
+  <your question>
+
+For *replies*, only the new message is sent (the session already contains
+the full conversation history): >
+
+  (Continuing review of src/algo.ts lines 42–46)
+
+  <your reply>
+
+==============================================================================
+7. REQUIREMENTS                                   *agent-review-requirements*
+
+- Backend CLI in $PATH: `claude` for the default backend, `opencode`
+  for |:ReviewBackend| `opencode`.
+- An active agent session in the current project.
+- Neovim 0.9+.
+
+==============================================================================
+8. TESTS                                                 *agent-review-tests*
+
+Headless regression tests (plenary busted harness, no live model or
+daemon — external calls are stubbed): >
+
+  ./agent-review.nvim/tests/run.sh
+
+Tests live in `agent-review.nvim/tests/` next to a `minimal_init.lua`
+that loads only the plugin plus plenary: no lazy.nvim, no network, no
+user config. The runner exits nonzero on failure, so it fits in CI.
+
+Implementation: `agent-review.nvim/lua/agent-review/init.lua`
+(single file, no external dependencies).
+
+vim:tw=78:ts=8:noet:ft=help:norl:
