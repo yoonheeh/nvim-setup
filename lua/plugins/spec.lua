@@ -1,18 +1,6 @@
 -- Assorted lazy-loaded utility plugins.
 return {
   {
-    "nvim-neorg/neorg",
-    -- lazy-load on filetype
-    ft = "norg",
-    -- automatically calls require("neorg").setup(opts)
-    opts = {
-      load = {
-        ["core.defaults"] = {},
-      },
-    },
-  },
-
-  {
     "dstein64/vim-startuptime",
     -- lazy-load on a command
     cmd = "StartupTime",
