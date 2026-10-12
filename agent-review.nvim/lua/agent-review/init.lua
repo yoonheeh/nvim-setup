@@ -1,15 +1,18 @@
--- GitHub-style code review interface backed by Claude terminal session.
--- Threads are session-only (not persisted). Transport: claude --resume <id> -p "..."
+-- GitHub-style code review interface backed by the agent terminal session
+-- that made the changes (Claude or OpenCode).
+-- Threads are session-only (not persisted). Transports:
+--   claude --resume <id> -p "..."  or  opencode run --session <id> "..."
+-- Backend: vim.g.review_backend / :ReviewBackend (default "claude").
 --
--- Each worktree tab (tab-local cwd via :tcd) gets its own Claude session,
--- threads, and panel, keyed by that cwd.
+-- Each worktree tab (tab-local cwd via :tcd) gets its own agent session
+-- (one cached id per backend), threads, and panel, keyed by that cwd.
 
 local M = {}
 
 local state = {
-  worktrees = {},   -- { [cwd] = { cwd, session_id, threads, active, panel_buf, panel_win } }
+  worktrees = {},   -- { [cwd] = { cwd, sessions = { [backend] = id }, threads, active, panel_buf, panel_win } }
   extmarks  = {},   -- { [bufnr] = { {id, thread}, ... } }
-  ns_id     = vim.api.nvim_create_namespace("claude_review"),
+  ns_id     = vim.api.nvim_create_namespace("agent_review"),
 }
 
 -- State for the worktree of the current tab.
@@ -17,7 +20,7 @@ local function current_wt()
   local cwd = vim.fn.getcwd()
   local wt  = state.worktrees[cwd]
   if not wt then
-    wt = { cwd = cwd, session_id = nil, threads = {}, active = nil, panel_buf = nil, panel_win = nil }
+    wt = { cwd = cwd, sessions = {}, threads = {}, active = nil, panel_buf = nil, panel_win = nil }
     state.worktrees[cwd] = wt
   end
   return wt
@@ -29,22 +32,147 @@ local function index_of(wt, thread)
   end
 end
 
--- ── Session discovery ────────────────────────────────────────────────────
--- Mirrors git-worktree.lua's JSONL-scanning approach.
+-- ── Backends ─────────────────────────────────────────────────────────────
+-- Review threads are answered by the agent session that made the changes.
+-- Each backend provides session discovery for a worktree cwd plus a one-shot
+-- ask() transport that calls back with the response text (or nil).
+-- Active backend: vim.g.review_backend ("claude" default); see :ReviewBackend.
 
-local function find_session_id(cwd)
-  local encoded = cwd:gsub("[/.]", "-")
-  local proj    = vim.fn.expand("~/.claude/projects/" .. encoded)
+local backends = {}
 
-  local newest, newest_mtime = nil, 0
-  for _, f in ipairs(vim.fn.glob(proj .. "/*.jsonl", false, true)) do
-    local st = vim.uv.fs_stat(f)
-    if st and st.mtime.sec > newest_mtime then
-      newest, newest_mtime = f, st.mtime.sec
+backends.claude = {
+  name = "Claude",
+  -- Mirrors git-worktree.lua's JSONL-scanning approach.
+  find_session_id = function(cwd)
+    local encoded = cwd:gsub("[/.]", "-")
+    local proj    = vim.fn.expand("~/.claude/projects/" .. encoded)
+
+    local newest, newest_mtime = nil, 0
+    for _, f in ipairs(vim.fn.glob(proj .. "/*.jsonl", false, true)) do
+      local st = vim.uv.fs_stat(f)
+      if st and st.mtime.sec > newest_mtime then
+        newest, newest_mtime = f, st.mtime.sec
+      end
     end
-  end
-  if not newest then return nil end
-  return vim.fn.fnamemodify(newest, ":t:r")  -- UUID, no extension
+    if not newest then return nil end
+    return vim.fn.fnamemodify(newest, ":t:r")  -- UUID, no extension
+  end,
+  ask = function(wt, sid, prompt, on_response)
+    local output = {}
+    -- Claude sessions are stored per project directory, so --resume must run in wt's cwd.
+    vim.fn.jobstart({ "claude", "--resume", sid, "-p", prompt }, {
+      cwd = wt.cwd,
+      -- Buffered: `data` arrives once, as the full output split on newlines.
+      -- Blank lines are kept; they separate markdown paragraphs.
+      stdout_buffered = true,
+      on_stdout = function(_, data)
+        output = data
+      end,
+      on_exit = function(_, code)
+        vim.schedule(function()
+          if code ~= 0 then
+            vim.notify("[agent-review] claude exited " .. code, vim.log.levels.WARN)
+            on_response(nil)
+          else
+            on_response(table.concat(output, "\n"):gsub("^%s+", ""):gsub("%s+$", ""))
+          end
+        end)
+      end,
+    })
+  end,
+}
+
+backends.opencode = {
+  name = "OpenCode",
+  -- Raw `session list` output (nil on missing binary / nonzero exit).
+  -- Split out so the pure parse below stays unit-testable: vim.v
+  -- (exit status) can't be stubbed from Lua.
+  run_session_list = function()
+    if vim.fn.executable("opencode") == 0 then return nil end
+    local out = vim.fn.system({ "opencode", "session", "list", "--format", "json", "-n", "50" })
+    if vim.v.shell_error ~= 0 then return nil end
+    return out
+  end,
+  -- Newest session id whose directory is this worktree's cwd (nil if none).
+  parse_session_list = function(out, cwd)
+    local ok, sessions = pcall(vim.json.decode, out)
+    if not ok or type(sessions) ~= "table" then return nil end
+    local real = vim.uv.fs_realpath(cwd) or cwd
+    local best, best_updated = nil, -1
+    for _, s in ipairs(sessions) do
+      if type(s) == "table" and type(s.id) == "string" and type(s.directory) == "string" then
+        local dir = vim.uv.fs_realpath(s.directory) or s.directory
+        if dir == real and (s.updated or 0) > best_updated then
+          best, best_updated = s.id, (s.updated or 0)
+        end
+      end
+    end
+    return best
+  end,
+  find_session_id = function(cwd)
+    local out = backends.opencode.run_session_list()
+    if not out then return nil end
+    return backends.opencode.parse_session_list(out, cwd)
+  end,
+  -- Extract reply text from `opencode run --format json` output lines
+  -- (one JSON object per line). Only text parts are kept, so tool-call
+  -- noise is skipped by construction. Returns nil when there is no text.
+  parse_text = function(data)
+    local texts = {}
+    for _, line in ipairs(data) do
+      local ok, ev = pcall(vim.json.decode, line)
+      if ok and type(ev) == "table" and ev.type == "text"
+        and type(ev.part) == "table" and ev.part.type == "text"
+        and type(ev.part.text) == "string" and ev.part.text ~= "" then
+        table.insert(texts, ev.part.text)
+      end
+    end
+    if #texts == 0 then return nil end
+    return table.concat(texts, "\n\n"):gsub("^%s+", ""):gsub("%s+$", "")
+  end,
+  -- `opencode run --session` continues the session in place (like --resume).
+  -- --format json streams one object per line; text parts carry the full
+  -- reply, so tool-call noise is skipped by construction.
+  ask = function(wt, sid, prompt, on_response)
+    if vim.fn.executable("opencode") == 0 then
+      vim.notify("[agent-review] opencode not found in $PATH", vim.log.levels.ERROR)
+      on_response(nil)
+      return
+    end
+    local lines = {}
+    local job = vim.fn.jobstart({ "opencode", "run", "-s", sid, "--format", "json", prompt }, {
+      cwd = wt.cwd,
+      stdout_buffered = true,
+      on_stdout = function(_, data)
+        vim.list_extend(lines, data)
+      end,
+      on_exit = function(_, code)
+        vim.schedule(function()
+          if code ~= 0 then
+            vim.notify("[agent-review] opencode exited " .. code, vim.log.levels.WARN)
+            on_response(nil)
+            return
+          end
+          local text = backends.opencode.parse_text(lines)
+          if not text then
+            vim.notify("[agent-review] opencode returned no text", vim.log.levels.WARN)
+            on_response(nil)
+          else
+            on_response(text)
+          end
+        end)
+      end,
+    })
+    -- Non-interactive call: close stdin so `opencode run` can't block
+    -- reading from the pipe Neovim holds open for the job.
+    if job > 0 then pcall(vim.fn.jobclose, job, "stdin") end
+  end,
+}
+
+local function current_backend()
+  local b = vim.g.review_backend or "claude"
+  if not backends[b] then return "claude" end
+  return b
 end
 
 -- ── Panel ────────────────────────────────────────────────────────────────
@@ -55,8 +183,8 @@ end
 -- around the window; keep only FloatBorder's colour for the border lines.
 local function float_winhighlight()
   local border = vim.api.nvim_get_hl(0, { name = "FloatBorder", link = false })
-  vim.api.nvim_set_hl(0, "ClaudeReviewBorder", { fg = border.fg })
-  return "Normal:Normal,FloatBorder:ClaudeReviewBorder,FloatTitle:Title,FloatFooter:Comment"
+  vim.api.nvim_set_hl(0, "AgentReviewBorder", { fg = border.fg })
+  return "Normal:Normal,FloatBorder:AgentReviewBorder,FloatTitle:Title,FloatFooter:Comment"
 end
 
 local function panel_is_float(wt)
@@ -77,7 +205,7 @@ local function ensure_panel(wt)
   wt.panel_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_option_value("buftype",   "nofile", { buf = wt.panel_buf })
   vim.api.nvim_set_option_value("bufhidden", "wipe",   { buf = wt.panel_buf })
-  vim.b[wt.panel_buf].claude_review = true
+  vim.b[wt.panel_buf].agent_review = true
   -- Thread text is written as markdown; render-markdown.nvim draws it. Its
   -- per-buffer settings are fixed the first time it sees the buffer, so pass
   -- them before setting the filetype:
@@ -98,11 +226,11 @@ local function ensure_panel(wt)
 
   -- Normally the panel is a real split on the far right, so your own splits
   -- share the remaining width instead of being covered. When the file is open
-  -- inside a floating window (the full-screen Claude Code window), a split
-  -- would sit underneath that float, so use a float on top instead.
+  -- inside a floating window (a full-screen agent float), a split would sit
+  -- underneath that float, so use a float on top instead.
   local cur = vim.api.nvim_get_current_win()
   local from_float = vim.api.nvim_win_get_config(cur).relative ~= ""
-    and not vim.b[vim.api.nvim_win_get_buf(cur)].claude_review
+    and not vim.b[vim.api.nvim_win_get_buf(cur)].agent_review
 
   if from_float then
     -- col: leave 1 cell gap so the right border doesn't overflow vim.o.columns
@@ -184,14 +312,14 @@ local function render_panel(wt, thread)
   for _, msg in ipairs(thread.messages) do
     add("")
     -- Different heading levels so render-markdown gives each speaker its own colour and icon.
-    add(msg.role == "user" and "### You" or "## Claude")
+    add(msg.role == "user" and "### You" or "## " .. (thread.speaker or "Claude"))
     add("")
     add(msg.content)
   end
 
   if thread.loading then
     add("")
-    add("*\226\143\179 Claude is thinking\226\128\166*")
+    add("*\226\143\179 " .. (thread.speaker or "Claude") .. " is thinking\226\128\166*")
   end
 
   vim.api.nvim_buf_set_lines(wt.panel_buf, 0, -1, false, lines)
@@ -223,7 +351,7 @@ local function render_panel(wt, thread)
     local shown = vim.api.nvim_win_get_buf(wt.panel_win)
     if shown ~= wt.panel_buf then
       vim.notify(
-        string.format("[claude-review] BUG: panel_win %d shows buf %d, expected buf %d",
+        string.format("[agent-review] BUG: panel_win %d shows buf %d, expected buf %d",
           wt.panel_win, shown, wt.panel_buf),
         vim.log.levels.ERROR
       )
@@ -260,35 +388,27 @@ end
 
 -- ── Transport ────────────────────────────────────────────────────────────
 
-local function run_claude(wt, prompt, on_response)
-  local sid = wt.session_id
+-- Resolve the active backend's session lazily at submit time so the panel
+-- always opens; each backend's id is cached separately on the worktree.
+local function resolve_session(wt)
+  local name = current_backend()
+  wt.sessions = wt.sessions or {}
+  if not wt.sessions[name] then
+    wt.sessions[name] = backends[name].find_session_id(wt.cwd)
+  end
+  return name, wt.sessions[name]
+end
+
+local function run_backend(wt, prompt, on_response)
+  local name = current_backend()
+  local sid = wt.sessions and wt.sessions[name]
   if not sid then
-    vim.notify("[claude-review] No Claude session found for this project", vim.log.levels.ERROR)
+    vim.notify("[agent-review] No " .. backends[name].name .. " session found for this project",
+      vim.log.levels.ERROR)
     on_response(nil)
     return
   end
-
-  local output = {}
-  -- Claude sessions are stored per project directory, so --resume must run in wt's cwd.
-  vim.fn.jobstart({ "claude", "--resume", sid, "-p", prompt }, {
-    cwd = wt.cwd,
-    -- Buffered: `data` arrives once, as the full output split on newlines.
-    -- Blank lines are kept; they separate markdown paragraphs.
-    stdout_buffered = true,
-    on_stdout = function(_, data)
-      output = data
-    end,
-    on_exit = function(_, code)
-      vim.schedule(function()
-        if code ~= 0 then
-          vim.notify("[claude-review] claude exited " .. code, vim.log.levels.WARN)
-          on_response(nil)
-        else
-          on_response(table.concat(output, "\n"):gsub("^%s+", ""):gsub("%s+$", ""))
-        end
-      end)
-    end,
-  })
+  backends[name].ask(wt, sid, prompt, on_response)
 end
 
 -- ── Prompt builders ───────────────────────────────────────────────────────
@@ -307,7 +427,7 @@ local function build_first_prompt(wt, thread, question)
   local diff = get_diff(wt.cwd, thread.file)
 
   local parts = {
-    "[claude-review] Automated inline review request from Neovim. Answer the question directly; no meta-commentary needed.",
+    "[agent-review] Automated inline review request from Neovim. Answer the question directly; no meta-commentary needed.",
     "",
     string.format("File: %s, lines %d\226\128\147%d:", thread.rel, thread.start_line, thread.end_line),
     "```" .. (ft ~= "" and ft or ""),
@@ -325,7 +445,7 @@ end
 
 local function build_reply_prompt(thread, reply_text)
   return string.format(
-    "[claude-review] Follow-up on %s lines %d\226\128\147%d.\n\n%s",
+    "[agent-review] Follow-up on %s lines %d\226\128\147%d.\n\n%s",
     thread.rel, thread.start_line, thread.end_line, reply_text
   )
 end
@@ -335,7 +455,7 @@ end
 -- GitHub's inline comments. The lines stay highlighted while you type.
 
 local input_counter = 0
-local input_ns      = vim.api.nvim_create_namespace("claude_review_input")
+local input_ns      = vim.api.nvim_create_namespace("agent_review_input")
 
 local INPUT_MIN_H = 2
 local INPUT_MAX_H = 12
@@ -369,8 +489,8 @@ local function open_input_panel(opts)
   local input_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_option_value("buftype",   "nofile", { buf = input_buf })
   vim.api.nvim_set_option_value("bufhidden", "wipe",   { buf = input_buf })
-  vim.api.nvim_buf_set_name(input_buf, "claude-review-input-" .. input_counter)
-  vim.b[input_buf].claude_review = true
+  vim.api.nvim_buf_set_name(input_buf, "agent-review-input-" .. input_counter)
+  vim.b[input_buf].agent_review = true
 
   local footer = " \226\143\142 send \194\183 Alt-\226\143\142 newline \194\183 Esc Esc cancel "
   local panel_valid = opts.panel_win and vim.api.nvim_win_is_valid(opts.panel_win)
@@ -509,7 +629,7 @@ local function open_input_panel(opts)
   end
 
   -- Placeholder while empty, and grow the box with its text.
-  local hint_ns = vim.api.nvim_create_namespace("claude_review_input_hint")
+  local hint_ns = vim.api.nvim_create_namespace("agent_review_input_hint")
   local function refresh()
     if not vim.api.nvim_win_is_valid(input_win) then return end
     vim.api.nvim_buf_clear_namespace(input_buf, hint_ns, 0, -1)
@@ -586,7 +706,7 @@ function M.start_thread()
   local rel = vim.fn.fnamemodify(filepath, ":.")
   open_input_panel({
     title       = string.format(" \240\159\146\172 %s : %d\226\128\147%d ", rel, start_line, end_line),
-    placeholder = "Ask Claude about these lines\226\128\166",
+    placeholder = "Ask " .. backends[current_backend()].name .. " about these lines\226\128\166",
     bufnr       = bufnr,
     start_line  = start_line,
     end_line    = end_line,
@@ -594,20 +714,19 @@ function M.start_thread()
     on_submit   = function(question)
       if not question or question == "" then return end
 
-      -- Resolve session lazily at submit time so the panel always opens
-      if not wt.session_id then
-        wt.session_id = find_session_id(wt.cwd)
-      end
-      if not wt.session_id then
+      local backend_name, sid = resolve_session(wt)
+      if not sid then
         vim.notify(
-          "[claude-review] No Claude session found for: " .. wt.cwd
-            .. "\n  Check :ClaudeReviewDebug for details.",
+          "[agent-review] No " .. backends[backend_name].name .. " session found for: " .. wt.cwd
+            .. "\n  Check :AgentReviewDebug for details.",
           vim.log.levels.ERROR
         )
         return
       end
 
       local thread = {
+        backend    = backend_name,
+        speaker    = backends[backend_name].name,
         file       = filepath,
         rel        = vim.fn.fnamemodify(filepath, ":."),
         filetype   = vim.api.nvim_get_option_value("filetype", { buf = bufnr }),
@@ -622,7 +741,7 @@ function M.start_thread()
       update_extmark(bufnr, thread)
       render_panel(wt, thread)
 
-      run_claude(wt, build_first_prompt(wt, thread, question), function(response)
+      run_backend(wt, build_first_prompt(wt, thread, question), function(response)
         thread.loading = false
         if response then
           table.insert(thread.messages, { role = "assistant", content = response })
@@ -640,14 +759,14 @@ function M.reply(wt)
   wt           = wt or current_wt()
   local thread = wt.active
   if not thread then
-    vim.notify("[claude-review] No active thread", vim.log.levels.WARN)
+    vim.notify("[agent-review] No active thread", vim.log.levels.WARN)
     return
   end
 
   local bufnr = vim.fn.bufnr(thread.file)
   open_input_panel({
     title       = " \226\134\169 Reply ",
-    placeholder = "Reply to Claude\226\128\166",
+    placeholder = "Reply to " .. backends[current_backend()].name .. "\226\128\166",
     bufnr       = bufnr ~= -1 and bufnr or nil,
     start_line  = thread.start_line,
     end_line    = thread.end_line,
@@ -660,7 +779,7 @@ function M.reply(wt)
       thread.loading = true
       render_panel(wt, thread)
 
-      run_claude(wt, build_reply_prompt(thread, reply_text), function(response)
+      run_backend(wt, build_reply_prompt(thread, reply_text), function(response)
         thread.loading = false
         table.insert(thread.messages, {
           role    = "assistant",
@@ -698,7 +817,7 @@ function M.open_at_cursor()
   if #wt.threads > 0 then
     focus_panel(wt, wt.threads[#wt.threads])
   else
-    vim.notify("[claude-review] No review threads yet. Select lines and press <leader>rc.", vim.log.levels.INFO)
+    vim.notify("[agent-review] No review threads yet. Select lines and press <leader>rc.", vim.log.levels.INFO)
   end
 end
 
@@ -756,7 +875,7 @@ function M.clear_threads()
   wt.active  = nil
 
   M.close_panel(wt)
-  vim.notify("[claude-review] Threads cleared", vim.log.levels.INFO)
+  vim.notify("[agent-review] Threads cleared", vim.log.levels.INFO)
 end
 
 -- ── Setup ──────────────────────────────────────────────────────────────────
@@ -767,13 +886,14 @@ function M.setup(_)
   if did_setup then return end
   did_setup = true
 
-  -- Debug command
-  vim.api.nvim_create_user_command("ClaudeReviewDebug", function()
+  -- Debug command (:ClaudeReviewDebug kept as an alias for muscle memory)
+  local show_debug = function()
     local wt      = current_wt()
     local encoded = wt.cwd:gsub("[/.]", "-")
     local proj    = vim.fn.expand("~/.claude/projects/" .. encoded)
     local files   = vim.fn.glob(proj .. "/*.jsonl", false, true)
-    local sid     = find_session_id(wt.cwd)
+    local bname   = current_backend()
+    local sid     = backends[bname].find_session_id(wt.cwd)
 
     local pbuf  = wt.panel_buf
     local pwin  = wt.panel_win
@@ -786,38 +906,56 @@ function M.setup(_)
       "cwd:        " .. wt.cwd,
       "proj dir:   " .. proj,
       "jsonl:      " .. #files .. " file(s)",
-      "session:    " .. (sid or "NOT FOUND") .. "  (in use: " .. (wt.session_id or "none yet") .. ")",
+      "backend:    " .. bname .. " (" .. backends[bname].name .. ")",
+      "session:    " .. (sid or "NOT FOUND") .. "  (in use: " .. ((wt.sessions or {})[bname] or "none yet") .. ")",
       "threads:    " .. #wt.threads,
       "panel_buf:  " .. tostring(pbuf) .. (pbuf_valid and " (valid)" or " (INVALID)"),
       "panel_win:  " .. tostring(pwin) .. (pwin_valid and " (valid)" or " (INVALID)"),
       "win shows:  buf " .. shown .. (match and "  ✓ match" or "  ✗ MISMATCH — text goes to wrong buffer"),
     }
     vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
-  end, {})
+  end
+  vim.api.nvim_create_user_command("AgentReviewDebug", show_debug, {})
+  vim.api.nvim_create_user_command("ClaudeReviewDebug", show_debug, {})
+
+  -- Switch the answering backend. Bare :ReviewBackend prints the current one.
+  vim.api.nvim_create_user_command("ReviewBackend", function(opts)
+    if opts.args == "" then
+      vim.notify("[agent-review] backend: " .. current_backend(), vim.log.levels.INFO)
+      return
+    end
+    if not backends[opts.args] then
+      vim.notify("[agent-review] unknown backend: " .. opts.args .. " (claude|opencode)",
+        vim.log.levels.ERROR)
+      return
+    end
+    vim.g.review_backend = opts.args
+    vim.notify("[agent-review] backend: " .. opts.args, vim.log.levels.INFO)
+  end, { nargs = "?", complete = function() return { "claude", "opencode" } end })
 
   -- Keymaps
   vim.keymap.set("v", "<leader>rc", function()
     -- Exit visual so '< '> marks are set, then call start_thread
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "x", false)
     vim.schedule(M.start_thread)
-  end, { desc = "Claude review: start thread on selection" })
+  end, { desc = "Agent review: start thread on selection" })
 
-  vim.keymap.set("n", "<leader>rt", M.open_at_cursor,  { desc = "Claude review: open thread at cursor" })
-  vim.keymap.set("n", "<leader>rn", function() M.navigate(1)  end, { desc = "Claude review: next thread" })
-  vim.keymap.set("n", "<leader>rp", function() M.navigate(-1) end, { desc = "Claude review: prev thread" })
-  vim.keymap.set("n", "<leader>rx", M.clear_threads,   { desc = "Claude review: clear threads for buffer" })
+  vim.keymap.set("n", "<leader>rt", M.open_at_cursor,  { desc = "Agent review: open thread at cursor" })
+  vim.keymap.set("n", "<leader>rn", function() M.navigate(1)  end, { desc = "Agent review: next thread" })
+  vim.keymap.set("n", "<leader>rp", function() M.navigate(-1) end, { desc = "Agent review: prev thread" })
+  vim.keymap.set("n", "<leader>rx", M.clear_threads,   { desc = "Agent review: clear threads for buffer" })
 
-  -- A floating panel (used when the file is inside the Claude Code float)
+  -- A floating panel (used when the file is inside a full-screen agent float)
   -- sits above default floats so that float doesn't cover it. That would also put it above popups like
   -- Telescope, so hide it while focus is in a floating window that isn't
-  -- showing a file (Telescope prompt, Claude terminal), and show it again
+  -- showing a file (Telescope prompt, agent terminal), and show it again
   -- once focus is back on a file.
   local function update_panel_visibility(force_hide)
     local win  = vim.api.nvim_get_current_win()
     local buf  = vim.api.nvim_win_get_buf(win)
     local hide = force_hide or (vim.api.nvim_win_get_config(win).relative ~= ""
       and vim.bo[buf].buftype ~= ""
-      and not vim.b[buf].claude_review)
+      and not vim.b[buf].agent_review)
     local tab = vim.api.nvim_get_current_tabpage()
     for _, wt in pairs(state.worktrees) do
       local pw = wt.panel_win
@@ -828,7 +966,7 @@ function M.setup(_)
     end
   end
 
-  local vis_group = vim.api.nvim_create_augroup("ClaudeReviewPanelVisibility", { clear = true })
+  local vis_group = vim.api.nvim_create_augroup("AgentReviewPanelVisibility", { clear = true })
   vim.api.nvim_create_autocmd("WinEnter", {
     group    = vis_group,
     callback = function() update_panel_visibility(false) end,
@@ -848,7 +986,7 @@ function M.setup(_)
 
   -- Clean up extmarks when a buffer is deleted
   vim.api.nvim_create_autocmd("BufDelete", {
-    group    = vim.api.nvim_create_augroup("ClaudeReview", { clear = true }),
+    group    = vim.api.nvim_create_augroup("AgentReview", { clear = true }),
     callback = function(ev)
       local bufnr = ev.buf
       for _, em in ipairs(state.extmarks[bufnr] or {}) do
@@ -858,5 +996,14 @@ function M.setup(_)
     end,
   })
 end
+
+-- Test seam for headless regression tests (see agent-review.nvim/tests/).
+-- Interactive use is covered by :AgentReviewDebug.
+M._test = {
+  backends = backends,
+  current_backend = current_backend,
+  resolve_session = resolve_session,
+  run_backend = run_backend,
+}
 
 return M
