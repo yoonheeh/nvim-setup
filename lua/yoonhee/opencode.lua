@@ -8,6 +8,20 @@ local M = {}
 local win = nil
 local buf = nil
 
+-- Root of this config checkout (scripts/ lives next to lua/). Resolved from
+-- this file's own path rather than stdpath("config"), so the launcher also
+-- works from a checkout that isn't literally at ~/.config/nvim (CI runners,
+-- dev clones, symlinked configs).
+local function config_root()
+  local src = debug.getinfo(1, "S").source
+  if src:sub(1, 1) == "@" then
+    local dir = vim.fn.fnamemodify(src:sub(2), ":h") -- lua/yoonhee/
+    dir = vim.fn.fnamemodify(dir, ":h") -- lua/
+    return vim.fn.fnamemodify(dir, ":h") -- <root>/
+  end
+  return vim.fn.stdpath("config")
+end
+
 local function is_valid_win()
   return win and vim.api.nvim_win_is_valid(win)
 end
@@ -45,7 +59,7 @@ function M.open(args)
     return
   end
 
-  local script = vim.fn.stdpath("config") .. "/scripts/opencode-tmux.sh"
+  local script = config_root() .. "/scripts/opencode-tmux.sh"
   if vim.fn.executable(script) == 0 then
     vim.notify("[opencode] script not executable: " .. script, vim.log.levels.ERROR)
     return
