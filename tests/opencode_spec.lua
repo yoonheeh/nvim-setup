@@ -180,6 +180,20 @@ describe("opencode float failure cases", function()
     return false
   end
 
+  it("resolves the launcher script from the checkout, not stdpath(config)", function()
+    -- The repo under test is not necessarily at ~/.config/nvim (CI checks
+    -- out elsewhere). The executable check must hit <root>/scripts/..., so
+    -- capture the probed path instead of hardcoding any location.
+    local seen = {}
+    vim.fn.executable = function(p) table.insert(seen, p); return 0 end
+    OC.open("")
+    assert.falsy(OC.is_open())
+    local dir = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h") -- tests/
+    local root = vim.fn.fnamemodify(dir, ":h") -- <root>/
+    assert.are.equal(1, #seen)
+    assert.are.equal(root .. "/scripts/opencode-tmux.sh", seen[1])
+  end)
+
   it("refuses to open when the launcher script is not executable", function()
     vim.fn.executable = function() return 0 end
     OC.open("")

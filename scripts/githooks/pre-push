@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# pre-push gate: run the headless regression suites before anything leaves
+# this machine. Git never clones hooks, so enable once per clone:
+#   git config core.hooksPath scripts/githooks
+# Requires nvim on $PATH and plenary.nvim under stdpath("data")/lazy (i.e.
+# the normal lazy.nvim setup). CI (.github/workflows/nvim-tests.yml) runs
+# these same suites on push/PR, so this hook is purely a fast local check.
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+"$root/tests/run.sh"
+"$root/agent-review.nvim/tests/run.sh"

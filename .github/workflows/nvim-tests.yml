@@ -1,0 +1,37 @@
+name: nvim-tests
+
+# Presubmit for the headless regression suites: agent-review backends and the
+# :OpenCode float. Both harnesses need only Neovim + plenary.nvim (no lazy
+# setup, no network at test time).
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  headless-suites:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neovim (stable)
+        run: |
+          curl -sL https://github.com/neovim/neovim/releases/download/stable/nvim-linux-x86_64.tar.gz -o /tmp/nvim.tar.gz
+          tar xzf /tmp/nvim.tar.gz -C /tmp
+          echo "/tmp/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Install plenary.nvim (test harness)
+        run: |
+          mkdir -p ~/.local/share/nvim/lazy
+          git clone --depth 1 https://github.com/nvim-lua/plenary.nvim ~/.local/share/nvim/lazy/plenary.nvim
+
+      - name: Show versions
+        run: |
+          nvim --version | head -3
+          git -C ~/.local/share/nvim/lazy/plenary.nvim log --oneline -1
+
+      - name: agent-review suite
+        run: ./agent-review.nvim/tests/run.sh
+
+      - name: opencode suite
+        run: ./tests/run.sh
