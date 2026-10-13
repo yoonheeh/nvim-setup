@@ -6,6 +6,7 @@
 return {
     {
     "nvim-treesitter/nvim-treesitter",
+    branch = "main",
     lazy = false, -- upstream does not support lazy-loading
     build = ":TSUpdate",
     config = function()
