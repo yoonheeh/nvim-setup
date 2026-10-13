@@ -34,3 +34,21 @@ jobs:
 
       - name: opencode suite
         run: ./tests/run.sh
+
+  # Starts the full config with nothing installed: lazy.nvim must install every
+  # plugin at its lazy-lock.json commit, the treesitter parsers must compile,
+  # and sample files must get highlighting. Pinned to Neovim 0.11 because
+  # nvim-treesitter master does not support 0.12.
+  fresh-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neovim 0.11.0
+        run: |
+          curl -sL https://github.com/neovim/neovim/releases/download/v0.11.0/nvim-linux-x86_64.tar.gz -o /tmp/nvim.tar.gz
+          tar xzf /tmp/nvim.tar.gz -C /tmp
+          echo "/tmp/nvim-linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Fresh install
+        run: ./tests/fresh-install.sh
