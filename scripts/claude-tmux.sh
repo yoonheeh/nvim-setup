@@ -14,6 +14,11 @@ conf="$(dirname "$(readlink -f "$0")")/claude-tmux.conf"
 dir=$(pwd -P)
 name="claude${dir//[^a-zA-Z0-9]/-}"
 
+# The first tmux command starts the server, which keeps this script's working
+# directory as its own. If that's a worktree that later gets removed, tmux can
+# no longer start any new session (even with -c), so start it from $HOME.
+cd "$HOME" || exit 1
+
 if "$tmux" -L nvim-claude has-session -t "=$name" 2>/dev/null; then
   exec "$tmux" -L nvim-claude -f "$conf" attach-session -t "=$name"
 fi
